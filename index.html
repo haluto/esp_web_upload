@@ -52,7 +52,7 @@
 
     <script>
         // ===== Constants =====
-        const FIRMWARE_ASSET_NAME = 'target.bin';
+        const FIRMWARE_DIR = 'firmware';
         const CHIP_FAMILY = 'ESP32-S3';
         const FIRMWARE_DISPLAY_NAME = 'ESP32-S3 Firmware';
 
@@ -62,9 +62,7 @@
         const button = document.getElementById('installButton');
 
         // ===== 1. Resolve owner / repo =====
-        // Priority: config.json > auto-detect from URL
         async function resolveRepoInfo() {
-            // Try to load config.json from the same directory
             try {
                 const resp = await fetch('config.json', { cache: 'no-store' });
                 if (resp.ok) {
@@ -73,63 +71,69 @@
                         return { owner: cfg.owner, repo: cfg.repo };
                     }
                 }
-            } catch (e) {
-                // config.json not found or invalid, fall through to auto-detect
-            }
+            } catch (e) { /* ignore */ }
 
-            // Auto-detect from the current URL
             const host = location.hostname;
             const pathParts = location.pathname.split('/').filter(Boolean);
-
             if (host.endsWith('.github.io')) {
                 const owner = host.slice(0, -'.github.io'.length);
-                // Project site: owner.github.io/repo/
-                // User site: owner.github.io/
                 const repo = pathParts[0] || `${owner}.github.io`;
                 return { owner, repo };
             }
-
             return null;
         }
 
-        // ===== 2. Fetch release list from GitHub Releases API =====
-        async function loadReleases(owner, repo) {
-            const apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases`;
+        // ===== 2. List firmware files via GitHub Contents API =====
+        async function listFirmwareFiles(owner, repo) {
+            const apiUrl = `https://api.github.com/repos/${owner}/${repo}/contents/${FIRMWARE_DIR}`;
             const resp = await fetch(apiUrl);
             if (!resp.ok) {
                 throw new Error(`GitHub API request failed: HTTP ${resp.status}`);
             }
-            return await resp.json();
+            const items = await resp.json();
+            // Filter .bin files
+            return items
+                .filter(item => item.type === 'file' && item.name.toLowerCase().endsWith('.bin'))
+                .map(item => ({
+                    fileName: item.name,
+                    version: item.name.replace(/\.bin$/i, ''),
+                    downloadUrl: item.download_url
+                }));
         }
 
-        // ===== 3. Build a manifest for the selected release =====
-        function buildManifestForRelease(release) {
-            const asset = release.assets.find(a => a.name === FIRMWARE_ASSET_NAME);
-            if (!asset) {
-                button.removeAttribute('manifest');
-                status.textContent = `Release ${release.tag_name} does not contain ${FIRMWARE_ASSET_NAME}`;
-                return;
+        // ===== 3. Sort versions (newest first) =====
+        function compareVersions(a, b) {
+            const pa = a.version.replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+            const pb = b.version.replace(/^v/i, '').split('.').map(n => parseInt(n, 10) || 0);
+            const len = Math.max(pa.length, pb.length);
+            for (let i = 0; i < len; i++) {
+                const da = pa[i] || 0, db = pb[i] || 0;
+                if (da !== db) return db - da;   // descending
             }
+            return 0;
+        }
 
+        // ===== 4. Build manifest for a selected firmware =====
+        function buildManifest(fw) {
             const manifest = {
                 name: FIRMWARE_DISPLAY_NAME,
-                version: release.tag_name,
+                version: fw.version,
                 new_install_prompt_erase: true,
                 builds: [{
                     chipFamily: CHIP_FAMILY,
                     parts: [{
-                        path: asset.browser_download_url,
+                        // Relative path, same-origin, no CORS
+                        path: `${FIRMWARE_DIR}/${fw.fileName}`,
                         offset: 0
                     }]
                 }]
             };
-
             const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
             button.manifest = URL.createObjectURL(blob);
-            status.textContent = `Selected: ${release.tag_name}`;
+            status.textContent = `Selected: ${fw.version}`;
         }
 
-        // ===== 4. Initialize =====
+        // ===== 5. Initialize =====
         async function init() {
             try {
                 const info = await resolveRepoInfo();
@@ -139,43 +143,36 @@
                     return;
                 }
 
-                const releases = await loadReleases(info.owner, info.repo);
-                if (!Array.isArray(releases) || releases.length === 0) {
-                    select.innerHTML = '<option value="">No releases</option>';
-                    status.textContent = 'No releases have been published yet.';
+                const files = await listFirmwareFiles(info.owner, info.repo);
+                if (files.length === 0) {
+                    select.innerHTML = '<option value="">No firmware</option>';
+                    status.textContent = `No .bin files found in ${FIRMWARE_DIR}/`;
                     return;
                 }
 
-                // Populate the dropdown
+                files.sort(compareVersions);
+
                 select.innerHTML = '';
-                for (const release of releases) {
-                    const hasAsset = release.assets.some(a => a.name === FIRMWARE_ASSET_NAME);
+                for (const fw of files) {
                     const opt = document.createElement('option');
-                    opt.value = release.tag_name;
-                    opt.textContent = release.tag_name + (hasAsset ? '' : ' (no firmware)');
-                    opt.disabled = !hasAsset;
-                    opt._release = release;   // Attach the raw object directly
+                    opt.value = fw.version;
+                    opt.textContent = fw.version;
+                    opt._fw = fw;
                     select.appendChild(opt);
                 }
 
-                // Default to the first enabled option
-                const firstEnabled = Array.from(select.options).find(o => !o.disabled);
-                if (firstEnabled) {
-                    select.value = firstEnabled.value;
-                }
-
-                buildManifestForRelease(select.options[select.selectedIndex]._release);
+                buildManifest(files[0]);
             } catch (e) {
                 console.error(e);
                 select.innerHTML = '<option value="">Load failed</option>';
-                status.textContent = 'Failed to load releases: ' + e.message;
+                status.textContent = 'Failed to load firmware list: ' + e.message;
             }
         }
 
         select.addEventListener('change', () => {
             const opt = select.options[select.selectedIndex];
-            if (opt && opt._release) {
-                buildManifestForRelease(opt._release);
+            if (opt && opt._fw) {
+                buildManifest(opt._fw);
             }
         });
 
