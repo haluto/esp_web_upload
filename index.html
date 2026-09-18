@@ -1,11 +1,185 @@
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
-    <title>我的第一个 GitHub Pages</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ESP32-S3 Firmware Flasher</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            max-width: 600px;
+            margin: 60px auto;
+            padding: 0 20px;
+            text-align: center;
+            color: #333;
+        }
+        h1 { font-size: 1.5rem; margin-bottom: 8px; }
+        .hint { color: #666; font-size: 0.9rem; margin-bottom: 24px; }
+        .controls { margin-bottom: 32px; }
+        label { font-size: 0.95rem; color: #444; }
+        select {
+            margin-top: 8px;
+            padding: 8px 12px;
+            font-size: 1rem;
+            border-radius: 6px;
+            border: 1px solid #ccc;
+            min-width: 220px;
+            background: #fff;
+        }
+        #status { color: #888; font-size: 0.85rem; margin-top: 8px; min-height: 1.2em; }
+    </style>
 </head>
 <body>
-    <h1>你好，GitHub Pages！</h1>
-    <p>这个页面托管在 GitHub Pages 上。</p>
+    <h1>ESP32-S3 Firmware Flasher</h1>
+    <p class="hint">Use Chrome or Edge and connect the device via USB</p>
+
+    <div class="controls">
+        <label for="versionSelect">Select firmware version:</label><br>
+        <select id="versionSelect">
+            <option value="">Loading...</option>
+        </select>
+    </div>
+
+    <p id="status"></p>
+
+    <script type="module"
+        src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module">
+    </script>
+
+    <esp-web-install-button id="installButton"></esp-web-install-button>
+
+    <p class="hint" style="margin-top: 24px;">Do not disconnect the USB cable during flashing</p>
+
+    <script>
+        // ===== Constants =====
+        const FIRMWARE_ASSET_NAME = 'target.bin';
+        const CHIP_FAMILY = 'ESP32-S3';
+        const FIRMWARE_DISPLAY_NAME = 'ESP32-S3 Firmware';
+
+        // ===== DOM =====
+        const select = document.getElementById('versionSelect');
+        const status = document.getElementById('status');
+        const button = document.getElementById('installButton');
+
+        // ===== 1. Resolve owner / repo =====
+        // Priority: config.json > auto-detect from URL
+        async function resolveRepoInfo() {
+            // Try to load config.json from the same directory
+            try {
+                const resp = await fetch('config.json', { cache: 'no-store' });
+                if (resp.ok) {
+                    const cfg = await resp.json();
+                    if (cfg.owner && cfg.repo) {
+                        return { owner: cfg.owner, repo: cfg.repo };
+                    }
+                }
+            } catch (e) {
+                // config.json not found or invalid, fall through to auto-detect
+            }
+
+            // Auto-detect from the current URL
+            const host = location.hostname;
+            const pathParts = location.pathname.split('/').filter(Boolean);
+
+            if (host.endsWith('.github.io')) {
+                const owner = host.slice(0, -'.github.io'.length);
+                // Project site: owner.github.io/repo/
+                // User site: owner.github.io/
+                const repo = pathParts[0] || `${owner}.github.io`;
+                return { owner, repo };
+            }
+
+            return null;
+        }
+
+        // ===== 2. Fetch release list from GitHub Releases API =====
+        async function loadReleases(owner, repo) {
+            const apiUrl = `https://api.github.com/repos/${owner}/${repo}/releases`;
+            const resp = await fetch(apiUrl);
+            if (!resp.ok) {
+                throw new Error(`GitHub API request failed: HTTP ${resp.status}`);
+            }
+            return await resp.json();
+        }
+
+        // ===== 3. Build a manifest for the selected release =====
+        function buildManifestForRelease(release) {
+            const asset = release.assets.find(a => a.name === FIRMWARE_ASSET_NAME);
+            if (!asset) {
+                button.removeAttribute('manifest');
+                status.textContent = `Release ${release.tag_name} does not contain ${FIRMWARE_ASSET_NAME}`;
+                return;
+            }
+
+            const manifest = {
+                name: FIRMWARE_DISPLAY_NAME,
+                version: release.tag_name,
+                new_install_prompt_erase: true,
+                builds: [{
+                    chipFamily: CHIP_FAMILY,
+                    parts: [{
+                        path: asset.browser_download_url,
+                        offset: 0
+                    }]
+                }]
+            };
+
+            const blob = new Blob([JSON.stringify(manifest)], { type: 'application/json' });
+            button.manifest = URL.createObjectURL(blob);
+            status.textContent = `Selected: ${release.tag_name}`;
+        }
+
+        // ===== 4. Initialize =====
+        async function init() {
+            try {
+                const info = await resolveRepoInfo();
+                if (!info) {
+                    status.textContent = 'Unable to determine repository info. Add config.json or deploy on GitHub Pages.';
+                    select.innerHTML = '<option value="">Unavailable</option>';
+                    return;
+                }
+
+                const releases = await loadReleases(info.owner, info.repo);
+                if (!Array.isArray(releases) || releases.length === 0) {
+                    select.innerHTML = '<option value="">No releases</option>';
+                    status.textContent = 'No releases have been published yet.';
+                    return;
+                }
+
+                // Populate the dropdown
+                select.innerHTML = '';
+                for (const release of releases) {
+                    const hasAsset = release.assets.some(a => a.name === FIRMWARE_ASSET_NAME);
+                    const opt = document.createElement('option');
+                    opt.value = release.tag_name;
+                    opt.textContent = release.tag_name + (hasAsset ? '' : ' (no firmware)');
+                    opt.disabled = !hasAsset;
+                    opt._release = release;   // Attach the raw object directly
+                    select.appendChild(opt);
+                }
+
+                // Default to the first enabled option
+                const firstEnabled = Array.from(select.options).find(o => !o.disabled);
+                if (firstEnabled) {
+                    select.value = firstEnabled.value;
+                }
+
+                buildManifestForRelease(select.options[select.selectedIndex]._release);
+            } catch (e) {
+                console.error(e);
+                select.innerHTML = '<option value="">Load failed</option>';
+                status.textContent = 'Failed to load releases: ' + e.message;
+            }
+        }
+
+        select.addEventListener('change', () => {
+            const opt = select.options[select.selectedIndex];
+            if (opt && opt._release) {
+                buildManifestForRelease(opt._release);
+            }
+        });
+
+        init();
+    </script>
 </body>
 </html>
